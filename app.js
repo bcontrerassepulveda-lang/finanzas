@@ -1,6 +1,13 @@
 ﻿const STORE_KEY = "finanzas-claras:v1";
+const STORE_OWNER_KEY = `${STORE_KEY}:legacy-owner`;
 
 const FIREBASE_CONFIG_KEY = "mi-portal-financiero:firebase-config";
+const GROQ_PROXY_URL = window.FINANCE_GROQ_PROXY_URL || "http://localhost:8787/groq";
+const GROQ_MODELS = [
+  "llama-3.3-70b-versatile",
+  "meta-llama/llama-4-scout-17b-16e-instruct",
+  "llama-3.1-8b-instant",
+];
 
 const icons = {
   dashboard: "D",
@@ -54,6 +61,10 @@ const defaultState = () => ({
     lastImportSummary: null,
     movementFlowFilter: "all",
     projectionTypes: {},
+    aiModel: "llama-3.3-70b-versatile",
+    aiChat: [],
+    aiBusy: false,
+    aiFloatingOpen: false,
   },
   settings: {
     storageDriver: "localStorage",
@@ -84,26 +95,7 @@ function consumeResetParam() {
 }
 
 const shouldStartBlank = consumeResetParam();
-let state = loadState();
-if (shouldStartBlank) {
-  state = blankAppState();
-  saveState();
-}
-const categoryMigration = ensureSeedCategories(state);
-if (categoryMigration.changed) {
-  state = categoryMigration.state;
-  saveState();
-}
-const demoCleanup = purgeDemoData(state);
-if (demoCleanup.changed) {
-  state = demoCleanup.state;
-  saveState();
-}
-const monthMigration = migrateImportedAccountingMonth(state);
-if (monthMigration.changed) {
-  state = monthMigration.state;
-  saveState();
-}
+let state = defaultState();
 let modal = null;
 let editingId = null;
 let authReady = false;
@@ -131,19 +123,77 @@ function activeMonthDate(day = "01") {
   return `${activeMonth()}-${String(day).padStart(2, "0")}`;
 }
 
-function loadState() {
+function userStorageId() {
+  return authUser?.uid || authUser?.email || "";
+}
+
+function currentStoreKey() {
+  const id = userStorageId();
+  return id ? `${STORE_KEY}:user:${id}` : STORE_KEY;
+}
+
+function legacySharedState() {
   try {
     const raw = localStorage.getItem(STORE_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    return null;
+  }
+}
+
+function migrateLegacyStateForUser() {
+  const userKey = currentStoreKey();
+  if (userKey === STORE_KEY || localStorage.getItem(userKey)) return;
+  const legacy = legacySharedState();
+  if (!legacy?.transactions && !legacy?.profile) return;
+  const owner = localStorage.getItem(STORE_OWNER_KEY);
+  if (owner && owner !== userStorageId()) return;
+  localStorage.setItem(userKey, JSON.stringify(legacy));
+  localStorage.setItem(STORE_OWNER_KEY, userStorageId());
+}
+
+function normalizeLoadedState(incoming) {
+  return { ...defaultState(), ...incoming, ui: { ...defaultState().ui, ...(incoming.ui || {}) } };
+}
+
+function loadState() {
+  try {
+    const raw = localStorage.getItem(currentStoreKey());
     if (!raw) return defaultState();
     const incoming = JSON.parse(raw);
-    return { ...defaultState(), ...incoming, ui: { ...defaultState().ui, ...(incoming.ui || {}) } };
+    return normalizeLoadedState(incoming);
   } catch {
     return defaultState();
   }
 }
 
 function saveState() {
-  localStorage.setItem(STORE_KEY, JSON.stringify(state));
+  localStorage.setItem(currentStoreKey(), JSON.stringify(state));
+}
+
+function loadUserState() {
+  if (shouldStartBlank) {
+    state = blankAppState();
+    saveState();
+    return;
+  }
+  migrateLegacyStateForUser();
+  state = loadState();
+  const categoryMigration = ensureSeedCategories(state);
+  if (categoryMigration.changed) {
+    state = categoryMigration.state;
+    saveState();
+  }
+  const demoCleanup = purgeDemoData(state);
+  if (demoCleanup.changed) {
+    state = demoCleanup.state;
+    saveState();
+  }
+  const monthMigration = migrateImportedAccountingMonth(state);
+  if (monthMigration.changed) {
+    state = monthMigration.state;
+    saveState();
+  }
 }
 
 function storedFirebaseConfig() {
@@ -209,6 +259,11 @@ function initializeFirebaseAuth() {
     firebase.auth().onAuthStateChanged((user) => {
       authUser = user;
       authReady = true;
+      if (user) {
+        loadUserState();
+      } else {
+        state = defaultState();
+      }
       render();
     }, (error) => {
       authError = error.message || String(error);
@@ -225,6 +280,16 @@ function initializeFirebaseAuth() {
 function signInWithGoogle() {
   if (!window.firebase?.auth) return alert("Firebase Auth no esta cargado.");
   const provider = new firebase.auth.GoogleAuthProvider();
+  firebase.auth().signInWithPopup(provider).catch((error) => {
+    authError = error.message || String(error);
+    render();
+  });
+}
+
+function signInWithGithub() {
+  if (!window.firebase?.auth) return alert("Firebase Auth no esta cargado.");
+  const provider = new firebase.auth.GithubAuthProvider();
+  provider.addScope("read:user");
   firebase.auth().signInWithPopup(provider).catch((error) => {
     authError = error.message || String(error);
     render();
@@ -1506,6 +1571,7 @@ function render() {
           ${navButton("partners", "Socios", icons.partners)}
           ${navButton("calendar", "Calendario", icons.month)}
           ${navButton("projection", "Proyectar", icons.history)}
+          ${navButton("ai", "IA financiera", "IA")}
           ${navButton("import", "Importar", icons.import)}
           ${navButton("closing", "Cierre", icons.save)}
           ${navButton("settings", "Ajustes", icons.backup)}
@@ -1519,8 +1585,10 @@ function render() {
       </main>
     </div>
     ${modal ? renderModal() : ""}
+    ${renderFloatingAiWidget()}
   `;
   bindApp();
+  scrollAiMessagesToBottom();
 }
 
 function navButton(view, label, icon) {
@@ -1551,6 +1619,7 @@ function renderAuthScreen() {
         ${authError ? `<div class="auth-error">${escapeHtml(authError)}</div>` : ""}
         ${configured ? `
           <button class="primary-button auth-main-button" id="googleLogin">Entrar con Google</button>
+          <button class="ghost-button auth-main-button auth-github-button" id="githubLogin">Entrar con GitHub</button>
           <button class="ghost-button" id="editFirebaseConfig">Cambiar configuracion Firebase</button>
         ` : `
           <div class="auth-setup">
@@ -1575,6 +1644,8 @@ function renderAuthScreen() {
 function bindAuthScreen() {
   const login = document.querySelector("#googleLogin");
   if (login) login.addEventListener("click", signInWithGoogle);
+  const githubLogin = document.querySelector("#githubLogin");
+  if (githubLogin) githubLogin.addEventListener("click", signInWithGithub);
   const edit = document.querySelector("#editFirebaseConfig");
   if (edit) edit.addEventListener("click", () => {
     localStorage.removeItem(FIREBASE_CONFIG_KEY);
@@ -1627,6 +1698,7 @@ function viewTitle() {
     receivables: "Cobranzas y reembolsos",
     calendar: "Calendario de compras",
     projection: "Proyectar mes siguiente",
+    ai: "IA financiera",
     import: "Importacion y conciliacion",
     closing: "Cierre mensual",
     backup: "Respaldo JSON",
@@ -1643,6 +1715,7 @@ function renderView() {
   if (state.activeView === "receivables") return renderReceivables();
   if (state.activeView === "calendar") return renderPurchaseCalendar();
   if (state.activeView === "projection") return renderNextMonthProjection();
+  if (state.activeView === "ai") return renderAiAdvisor();
   if (state.activeView === "import") return renderImport();
   if (state.activeView === "closing") return renderClosing();
   if (state.activeView === "backup") return renderBackup();
@@ -3052,6 +3125,290 @@ function renderBackup() {
   `;
 }
 
+function clpNumber(value) {
+  return new Intl.NumberFormat("es-CL", { style: "currency", currency: "CLP", maximumFractionDigits: 0 }).format(Number(value || 0));
+}
+
+function aiFinancialSnapshot() {
+  const month = activeMonth();
+  const finance = monthFinance(month);
+  const globalFinance = computeFinance();
+  const distribution = distributionSummary(month);
+  const advisor = monthlyAdvisorRecommendation();
+  const partnerBalanceItems = partnerBalances();
+  const monthTxs = state.transactions
+    .filter((tx) => txMonth(tx) === month)
+    .sort((a, b) => b.date.localeCompare(a.date));
+  const recentTransactions = monthTxs.slice(0, 25).map((tx) => ({
+    fecha: tx.date,
+    descripcion: tx.description,
+    tipo: tx.kind,
+    categoria: tx.category,
+    distribucion: inferDistribution(tx),
+    monto: Number(tx.amount || 0),
+    banco: tx.bank || tx.account || tx.debtName || "",
+    cuota: tx.installmentCurrent && tx.installmentTotal ? `${tx.installmentCurrent}/${tx.installmentTotal}` : "",
+  }));
+  const goals = state.goals.map((goal) => {
+    const analysis = goalAnalysis(goal);
+    return {
+      nombre: goal.name,
+      tipo: goal.type,
+      meta: Number(goal.targetAmount || 0),
+      actual: Number(goal.currentAmount || 0),
+      fecha: goal.deadline || goal.targetMonth || "",
+      prioridad: goal.priority || "",
+      necesitaMensual: Math.round(analysis.monthlyNeed || 0),
+      brechaMensual: Math.round(analysis.shortfall || 0),
+    };
+  });
+  const debts = state.debts.map((debt) => ({
+    nombre: debt.name,
+    tipo: debt.type,
+    saldo: Number(debt.balance || 0),
+    total: Number(debt.amount || debt.balance || 0),
+    cuotaMensual: Number(debt.monthlyPayment || 0),
+    tasa: Number(debt.interestRate || 0),
+    vencimiento: debt.dueDate || "",
+  }));
+  const projection = projectedYearSeries().slice(0, 12).map((item) => ({
+    mes: item.month,
+    ingresos: Math.round(item.income || 0),
+    egresos: Math.round(item.expense || 0),
+    saldo: Math.round(item.balance || 0),
+  }));
+  return {
+    perfil: {
+      nombre: state.profile.name || "",
+      moneda: state.profile.currency || "CLP",
+      mesSeleccionado: month,
+    },
+    resumenMes: {
+      ingresos: Math.round(finance.income || 0),
+      gastoBruto: Math.round(finance.grossExpense || 0),
+      gastoNetoProyectado: Math.round(finance.netProjectedExpense || 0),
+      gastoNetoReal: Math.round(finance.netRealExpense || 0),
+      pagosDeuda: Math.round(finance.debtPayments || 0),
+      pasivoAbierto: Math.round(finance.outstandingDebt || 0),
+      flujoLibre: Math.round((finance.income || 0) - (finance.netProjectedExpense || 0) - (finance.debtPayments || 0)),
+    },
+    resumenGlobal: {
+      pasivoTotal: Math.round(globalFinance.outstandingDebt || 0),
+      cobranzasPendientes: Math.round(globalFinance.pendingProjectedRecovery || 0),
+    },
+    distribucionMes: distribution.totals,
+    recomendacionActual: advisor,
+    objetivos: goals,
+    deudas: debts,
+    socios: partnerBalanceItems.map((row) => ({
+      socio: row.partner?.name || "",
+      meDebe: Math.round(row.pending || 0),
+      leDebo: Math.round(row.payable || 0),
+      neto: Math.round(row.net || 0),
+    })),
+    transaccionesRecientesDelMes: recentTransactions,
+    proyeccion12Meses: projection,
+  };
+}
+
+function renderAiAdvisor() {
+  const chat = state.ui.aiChat || [];
+  const model = state.ui.aiModel || GROQ_MODELS[0];
+  const snapshot = aiFinancialSnapshot();
+  const quickQuestions = [
+    "Que debo recortar este mes para cumplir mis objetivos?",
+    "Estoy en riesgo con mis deudas?",
+    "Como se proyecta mi saldo en los proximos 12 meses?",
+    "Que gastos parecen permanentes y cuales pasajeros?",
+  ];
+  return `
+    <section class="ai-layout">
+      <div class="card panel ai-intro-card">
+        <div>
+          <span class="eyebrow">Analista senior con IA</span>
+          <h2>Pregunta sobre tus finanzas, deudas, socios y proyecciones</h2>
+          <p>La IA recibe un resumen estructurado de tus datos locales: movimientos del mes, objetivos, deudas, socios y proyeccion anual. No reemplaza asesoria financiera formal, pero sirve para tomar mejores decisiones.</p>
+        </div>
+        <div class="ai-model-box">
+          <label>Modelo Groq</label>
+          <select id="aiModel" data-ai-model>
+            ${GROQ_MODELS.map((item) => `<option value="${escapeAttr(item)}" ${item === model ? "selected" : ""}>${escapeHtml(item)}</option>`).join("")}
+          </select>
+        </div>
+      </div>
+      <div class="grid ai-snapshot-grid">
+        <div class="card ai-stat"><span>Ingreso del mes</span><strong>${clpNumber(snapshot.resumenMes.ingresos)}</strong></div>
+        <div class="card ai-stat"><span>Gasto neto proyectado</span><strong>${clpNumber(snapshot.resumenMes.gastoNetoProyectado)}</strong></div>
+        <div class="card ai-stat"><span>Flujo libre estimado</span><strong>${clpNumber(snapshot.resumenMes.flujoLibre)}</strong></div>
+        <div class="card ai-stat"><span>Pasivo abierto</span><strong>${clpNumber(snapshot.resumenMes.pasivoAbierto)}</strong></div>
+      </div>
+      <div class="card panel ai-chat-card">
+        <div class="panel-head">
+          <h2>Chat financiero</h2>
+          <button class="ghost-button" data-action="clear-ai-chat">Limpiar chat</button>
+        </div>
+        <div class="ai-quick-questions">
+          ${quickQuestions.map((question) => `<button class="ghost-button mini-button" data-ai-question="${escapeAttr(question)}">${escapeHtml(question)}</button>`).join("")}
+        </div>
+        <div class="ai-messages" id="aiMessages">
+          ${chat.length ? chat.map(renderAiMessage).join("") : `<div class="ai-empty">Haz una pregunta concreta. Por ejemplo: "quiero ahorrar 500.000 en 4 meses, que recorto?"</div>`}
+          ${state.ui.aiBusy ? `<div class="ai-message assistant"><strong>IA financiera</strong><p>Analizando tus numeros...</p></div>` : ""}
+        </div>
+        <form id="aiChatForm" class="ai-form">
+          <textarea id="aiPrompt" name="aiPrompt" rows="3" placeholder="Escribe tu pregunta: deuda, ahorro, gastos por banco, socios, proyeccion, cierre de mes..." ${state.ui.aiBusy ? "disabled" : ""}></textarea>
+          <button class="primary-button" ${state.ui.aiBusy ? "disabled" : ""}>Preguntar</button>
+        </form>
+        <p class="muted">Modo prueba: la consulta se envia a Groq con un resumen de tus datos financieros. La API key esta integrada localmente y debe cambiarse antes de publicar.</p>
+      </div>
+    </section>
+  `;
+}
+
+function renderFloatingAiWidget() {
+  const open = state.ui.aiFloatingOpen;
+  const chat = state.ui.aiChat || [];
+  const lastMessages = chat.slice(-5);
+  const model = state.ui.aiModel || GROQ_MODELS[0];
+  return `
+    <div class="floating-ai ${open ? "open" : ""}">
+      ${open ? `
+        <section class="floating-ai-panel" aria-label="Asistente financiero IA">
+          <div class="floating-ai-head">
+            <div>
+              <span>IA financiera</span>
+              <strong>Analista senior</strong>
+            </div>
+            <button class="ghost-button mini-button" data-action="toggle-floating-ai">Cerrar</button>
+          </div>
+          <div class="floating-ai-model">
+            <label>Modelo</label>
+            <select data-ai-model>
+              ${GROQ_MODELS.map((item) => `<option value="${escapeAttr(item)}" ${item === model ? "selected" : ""}>${escapeHtml(item)}</option>`).join("")}
+            </select>
+          </div>
+          <div class="floating-ai-messages">
+            ${lastMessages.length ? lastMessages.map(renderAiMessage).join("") : `<div class="ai-empty compact">Preguntame por metas, deudas, gastos o proyecciones.</div>`}
+            ${state.ui.aiBusy ? `<div class="ai-message assistant"><strong>IA financiera</strong><p>Estoy leyendo tus datos registrados...</p></div>` : ""}
+          </div>
+          <form class="floating-ai-form" data-ai-chat-form>
+            <textarea name="aiPrompt" rows="3" placeholder="Ej: que debo recortar este mes?" ${state.ui.aiBusy ? "disabled" : ""}></textarea>
+            <button class="primary-button" ${state.ui.aiBusy ? "disabled" : ""}>Enviar</button>
+          </form>
+        </section>
+      ` : ""}
+      <button class="floating-ai-button" data-action="toggle-floating-ai" title="Abrir IA financiera">
+        <span>$</span>
+        <strong>IA</strong>
+      </button>
+    </div>
+  `;
+}
+
+function renderAiMessage(message) {
+  const role = message.role === "user" ? "user" : "assistant";
+  const label = role === "user" ? "Tu" : "IA financiera";
+  return `
+    <div class="ai-message ${role}">
+      <strong>${label}</strong>
+      <p>${escapeHtml(message.content || "").replace(/\n/g, "<br>")}</p>
+    </div>
+  `;
+}
+
+function scrollAiMessagesToBottom() {
+  window.setTimeout(() => {
+    document.querySelectorAll(".ai-messages, .floating-ai-messages").forEach((box) => {
+      box.scrollTop = box.scrollHeight;
+    });
+  }, 0);
+}
+
+async function submitAiQuestion(event) {
+  event.preventDefault();
+  const promptEl = event.currentTarget.querySelector('[name="aiPrompt"], #aiPrompt');
+  const prompt = promptEl?.value.trim();
+  if (!prompt || state.ui.aiBusy) return;
+  state.ui.aiChat ||= [];
+  state.ui.aiChat.push({ role: "user", content: prompt, at: new Date().toISOString() });
+  state.ui.aiBusy = true;
+  saveState();
+  render();
+  try {
+    const answer = await askGroqFinancialAdvisor(prompt);
+    state.ui.aiChat.push({ role: "assistant", content: answer, at: new Date().toISOString() });
+  } catch (error) {
+    state.ui.aiChat.push({
+      role: "assistant",
+      content: `No pude conectar con Groq. Detalle: ${error.message || error}. Revisa internet, API key o permisos CORS del navegador.`,
+      at: new Date().toISOString(),
+    });
+  } finally {
+    state.ui.aiBusy = false;
+    saveState();
+    render();
+  }
+}
+
+async function askGroqFinancialAdvisor(prompt) {
+  const model = state.ui.aiModel || GROQ_MODELS[0];
+  const snapshot = aiFinancialSnapshot();
+  const history = (state.ui.aiChat || []).slice(-8).map((item) => ({
+    role: item.role === "assistant" ? "assistant" : "user",
+    content: item.content,
+  }));
+  const messages = [
+    {
+      role: "system",
+      content: [
+        "Eres un analista senior de finanzas personales y presupuesto familiar para Chile. Trabajas como un copiloto financiero dentro de una app local.",
+        "Usa un lenguaje cercano, amable y humano. Explica como si acompañaras a una persona que quiere ordenar sus finanzas sin sentirse juzgada.",
+        "Se claro, directo y cuidadoso. Evita sonar como informe bancario, auditoria o respuesta robotica. Mantiene el analisis serio, pero con tono conversacional.",
+        "Puedes usar frases simples como: mi recomendacion seria, ojo con esto, esto esta manejable, aqui conviene ir con calma, o esto requiere ajuste.",
+        "No exageres la cercania ni uses relleno emocional. La prioridad es que la persona entienda que decision tomar y por que.",
+        "Antes de responder, lee el JSON de contexto financiero completo y basa tu analisis solo en esos datos registrados. No inventes movimientos, bancos, saldos, ingresos, fechas, cuotas, socios ni objetivos.",
+        "Distingue con precision: flujo de caja, consumo, pasivo, pago de deuda, gasto bruto, gasto neto proyectado, gasto neto real, cobranzas pendientes, ahorro comprometido, objetivos activos y capacidad estimada de ahorro.",
+        "Evita doble contabilizacion de tarjeta: una compra con tarjeta es consumo y aumenta pasivo; el pago de tarjeta baja pasivo y afecta caja, pero no crea un segundo gasto de consumo.",
+        "Cuando la persona consulte si puede comprar algo, asumir una nueva cuota o financiar una compra a credito, debes hacer una proyeccion mensual considerando: precio total de la compra; monto contado si existe; numero de cuotas; valor de cada cuota; fecha de inicio del pago; gastos actuales registrados; deudas vigentes; ahorro comprometido; objetivos activos; capacidad estimada de ahorro; y flujo disponible mensual.",
+        "Si la compra es al contado, evalua cuanto reduce la caja disponible del mes y si afecta el cumplimiento de objetivos.",
+        "Si la compra es a credito, calcula el impacto mensual de la cuota durante todos los meses que dure el credito.",
+        "Debes proyectar el efecto de la compra en el presupuesto mensual, indicando: nuevo gasto mensual comprometido; nueva capacidad de ahorro estimada; brecha mensual respecto a los objetivos; meses en que la persona quedara mas ajustada; si la compra retrasa algun objetivo; si aumenta demasiado el uso de deuda o tarjeta; y si conviene comprar ahora, esperar, pagar al contado o elegir menos cuotas.",
+        "Nunca analices una compra a credito solo por el valor de la cuota. Siempre considera el total de cuotas y su efecto acumulado en los meses futuros.",
+        "Ejemplo obligatorio de criterio: si una compra cuesta $600.000 en 6 cuotas de $100.000, no digas solamente que la cuota es manejable. Debes evaluar que durante 6 meses habra $100.000 menos disponibles para ahorro, deuda u otros gastos.",
+        "Cuando falten datos para proyectar, pide el dato exacto que falta.",
+        "Datos minimos para proyectar una compra a credito: monto total de la compra; numero de cuotas; valor de la cuota si ya existe; mes de inicio del pago; si la compra sera con tarjeta de credito, credito de consumo u otro medio; y si tiene interes o es sin interes.",
+        "Si no se informa el valor de la cuota, calcula una estimacion simple: valor cuota estimada = monto total / numero de cuotas. Indica claramente que es una estimacion y que puede cambiar si existen intereses, comisiones o seguros.",
+        "Formato de respuesta recomendado para compras o creditos: 1. Diagnostico de la compra: indica si la compra parece conveniente, riesgosa o posible con ajuste. 2. Impacto mensual: muestra cuanto afectara el flujo mensual. 3. Proyeccion: explica que pasara durante los meses que duren las cuotas. 4. Efecto en objetivos: indica si algun objetivo se atrasa o requiere ajuste. 5. Recomendacion: entrega una accion concreta: comprar, esperar, reducir monto, pagar al contado, elegir menos cuotas, elegir mas cuotas solo si no afecta metas, o no comprar.",
+        "Cuando la compra afecte fuertemente el presupuesto, usa una alerta clara: Esta compra no es recomendable en este momento, porque la cuota reduce demasiado tu margen mensual y puede atrasar tus objetivos.",
+        "Cuando la compra sea viable, responde de forma positiva pero responsable: La compra es posible, siempre que mantengas el ahorro minimo y no sumes nuevas cuotas durante los proximos meses.",
+        "Para consultas generales no relacionadas con compras, responde como analista senior: diagnostica, muestra numeros clave, acciones priorizadas, riesgos/alertas y siguiente paso.",
+        "Usa CLP sin decimales y formato chileno. Responde en espanol claro, directo, accionable y con numeros trazables. No uses relleno.",
+      ].join(" "),
+    },
+    {
+      role: "user",
+      content: `Contexto financiero local en JSON:\n${JSON.stringify(snapshot, null, 2)}`,
+    },
+    ...history,
+    { role: "user", content: prompt },
+  ];
+  const payload = {
+    model,
+    messages,
+    temperature: 0.25,
+    max_tokens: 900,
+  };
+  const response = await fetch(GROQ_PROXY_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(data?.error?.message || `Groq respondio ${response.status}`);
+  }
+  return data?.choices?.[0]?.message?.content?.trim() || "No recibi una respuesta util del modelo.";
+}
+
 function renderSettings() {
   return `
     <section class="card panel">
@@ -3513,6 +3870,20 @@ function bindApp() {
     saveState();
     render();
   }));
+  document.querySelectorAll("[data-ai-model]").forEach((aiModel) => aiModel.addEventListener("change", () => {
+    state.ui ||= {};
+    state.ui.aiModel = aiModel.value || GROQ_MODELS[0];
+    saveState();
+    render();
+  }));
+  document.querySelectorAll("#aiChatForm, [data-ai-chat-form]").forEach((aiChatForm) => aiChatForm.addEventListener("submit", submitAiQuestion));
+  document.querySelectorAll("[data-ai-question]").forEach((btn) => btn.addEventListener("click", () => {
+    const prompt = document.querySelector("#aiPrompt") || document.querySelector('[name="aiPrompt"]');
+    if (prompt) {
+      prompt.value = btn.dataset.aiQuestion || "";
+      prompt.focus();
+    }
+  }));
   document.querySelectorAll("[data-modal]").forEach((btn) => btn.addEventListener("click", () => { modal = btn.dataset.modal; editingId = null; render(); }));
   document.querySelectorAll("[data-close-modal]").forEach((btn) => btn.addEventListener("click", () => { modal = null; editingId = null; render(); }));
   document.querySelectorAll("[data-collect]").forEach((btn) => btn.addEventListener("click", () => { collectReceivable(btn.dataset.collect); render(); }));
@@ -3787,6 +4158,19 @@ function handleAction(action) {
   }
   if (action === "toggle-mask") {
     state.profile.privacyMask = !state.profile.privacyMask;
+    saveState();
+    render();
+  }
+  if (action === "clear-ai-chat") {
+    state.ui ||= {};
+    state.ui.aiChat = [];
+    state.ui.aiBusy = false;
+    saveState();
+    render();
+  }
+  if (action === "toggle-floating-ai") {
+    state.ui ||= {};
+    state.ui.aiFloatingOpen = !state.ui.aiFloatingOpen;
     saveState();
     render();
   }
