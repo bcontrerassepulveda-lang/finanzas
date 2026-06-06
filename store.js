@@ -328,17 +328,47 @@ export function loadState() {
 }
 
 export function saveState() {
-  localStorage.setItem(currentStoreKey(), JSON.stringify(state));
+  try {
+    localStorage.setItem(currentStoreKey(), JSON.stringify(state));
+  } catch {
+    // ignore local save failures
+  }
+  saveRemoteState();
 }
 
-export function loadUserState() {
+export function saveRemoteState() {
+  if (!authUser || !window.firebase?.database) return;
+  try {
+    firebase.database().ref(`users/${authUser.uid}/state`).set(state);
+  } catch {
+    // ignore remote save failures
+  }
+}
+
+export async function loadRemoteState() {
+  if (!authUser || !window.firebase?.database) return null;
+  try {
+    const snapshot = await firebase.database().ref(`users/${authUser.uid}/state`).once("value");
+    if (!snapshot.exists()) return null;
+    return normalizeLoadedState(snapshot.val());
+  } catch {
+    return null;
+  }
+}
+
+export async function loadUserState() {
   if (shouldStartBlank) {
     setState(blankAppState());
     saveState();
     return;
   }
   migrateLegacyStateForUser();
-  setState(loadState());
+  const remoteState = await loadRemoteState();
+  if (remoteState) {
+    setState(remoteState);
+  } else {
+    setState(loadState());
+  }
   const categoryMigration = ensureSeedCategories(state);
   if (categoryMigration.changed) {
     setState(categoryMigration.state);

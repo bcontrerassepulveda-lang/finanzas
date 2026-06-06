@@ -71,11 +71,11 @@ function initializeFirebaseAuth() {
       setAuthUser(user);
       setAuthReady(true);
       if (user) {
-        loadUserState();
+        loadUserState().then(() => render());
       } else {
         setState(defaultState());
+        render();
       }
-      render();
     }, (error) => {
       setAuthError(error.message || String(error));
       setAuthReady(true);
@@ -115,7 +115,7 @@ function signOutGoogle() {
 const persistence = {
   load: loadState,
   save: saveState,
-  driver: "localStorage",
+  driver: () => authUser && window.firebase?.database ? "firebase" : "localStorage",
   canMigrateToIndexedDB: true,
 };
 
@@ -1330,7 +1330,7 @@ function render() {
           ${navButton("settings", "Ajustes", icons.backup)}
         </nav>
         <div class="privacy">Datos guardados localmente en este navegador. No se envian a servidores. Exporta respaldos periodicos y evita computadores compartidos.</div>
-        <div class="footer-note">Persistencia actual: ${persistence.driver}. Capa preparada para migrar a IndexedDB.</div>
+        <div class="footer-note">Persistencia actual: ${persistence.driver()}. Capa preparada para migrar a IndexedDB.</div>
       </aside>
       <main class="main">
         ${renderTopbar()}
@@ -3232,7 +3232,7 @@ function renderAiAdvisor() {
           <textarea id="aiPrompt" name="aiPrompt" rows="3" placeholder="Escribe tu pregunta: deuda, ahorro, gastos por banco, socios, proyeccion, cierre de mes..." ${state.ui.aiBusy ? "disabled" : ""}></textarea>
           <button class="primary-button" ${state.ui.aiBusy ? "disabled" : ""}>Preguntar</button>
         </form>
-        <p class="muted">Modo prueba: la consulta se envia a Groq con un resumen de tus datos financieros. La API key esta integrada localmente y debe cambiarse antes de publicar.</p>
+        <p class="muted">La consulta se envía a la API de Groq a través del proxy configurado en groq-config.js. Asegura tu clave Groq en el backend antes de publicar.</p>
       </div>
     </section>
   `;
