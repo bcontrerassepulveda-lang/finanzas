@@ -1,0 +1,12 @@
+{
+  "name": "mi-portal-financiero-functions",
+  "description": "Proxy seguro para Groq usado por Mi Portal Financiero.",
+  "private": true,
+  "engines": {
+    "node": "20"
+  },
+  "main": "index.js",
+  "dependencies": {
+    "firebase-functions": "^4.9.0"
+  }
+}
